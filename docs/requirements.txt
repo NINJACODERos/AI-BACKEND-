@@ -1,5 +1,0 @@
-fastapi
-uvicorn[standard]
-g4f
-ddgs
-pydantic
