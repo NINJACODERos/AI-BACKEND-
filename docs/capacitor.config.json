@@ -1,1 +1,10 @@
 
+{
+  "appId": "com.ninjacoderos.majdoorai",
+  "appName": "Majdoor AI",
+  "webDir": "www",
+  "bundledWebRuntime": false,
+  "android": {
+    "backgroundColor": "#1c1b19"
+  }
+}
