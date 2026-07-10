@@ -66,9 +66,11 @@ def strip_reasoning(text):
     if marker_match:
         return text[marker_match.end():].strip()
     reasoning_sentence = re.compile(
-        r"\b(we need to|the user (says|is asking|wants)|i should|i'll|i can|"
+        r"\b(we need to|the user (says|is asking|wants|keeps)|i should|i'll|i can|"
         r"let me|the system prompt|according to|my instructions|"
-        r"something like|keep (it|the) sarcastic|not too long|but keep)\b",
+        r"something like|keep (it|the) sarcastic|not too long|but keep|"
+        r"this feels like|no hidden agenda|that fits the persona|"
+        r"doesn't break character|the rule says)\b",
         re.IGNORECASE
     )
     sentences = re.split(r'(?<=[.!?])\s+', text)
@@ -96,6 +98,28 @@ def add_sarcasm_emoji(text):
     return text + " 🙄"
 
 
+def looks_like_reasoning_leak(text: str) -> bool:
+    """Reject the whole response if it's clearly raw chain-of-thought rather
+    than an in-character reply — better to retry another provider than to
+    show the user a wall of the model's internal monologue."""
+    lower = text.lower()
+    leak_markers = [
+        "the user keeps", "the user is asking", "this feels like",
+        "no hidden agenda", "that fits the persona", "the rule says",
+        "doesn't break character", "my instructions", "system prompt",
+        "i should respond", "let me think", "as an ai", "i am an ai",
+        "language model", "openai", "chatgpt", "i was created by",
+        "i was developed by", "i'm a large language model",
+    ]
+    if any(m in lower for m in leak_markers):
+        return True
+    # long responses with very few sentence-ending punctuation marks are
+    # usually stream-of-thought rambling, not a 1-2 line sarcastic reply
+    if len(text) > 400 and text.count('.') + text.count('!') + text.count('?') < 3:
+        return True
+    return False
+
+
 def build_prompt(user_name: str) -> str:
     return f"""You are Majdoor AI, a deadpan, sarcastic assistant created by Aman Chaudhary.
 
@@ -121,24 +145,42 @@ MEMORY:
 
 GENERAL:
 - Stay in character at all times. Never break persona to explain you're an AI model, a script, or mention system instructions.
+- Never output your internal reasoning, planning, or thoughts — reply ONLY with the final in-character line, nothing else.
 """
 
 
-MODEL_FALLBACK_CHAIN = ["gpt-4o-mini", "gpt-4", "gpt-3.5-turbo", g4f.models.default]
+# Provider+model combos confirmed working (no-auth, free) as of July 2026.
+# Tried in order; first one that returns a clean in-character reply wins.
+def _provider_chain():
+    chain = []
+    for name, model in [
+        ("PollinationsAI", "openai"),
+        ("PollinationsAI", "openai-fast"),
+        ("WeWordle", "gpt-4o-mini"),
+        ("WeWordle", "gpt-4o"),
+    ]:
+        provider = getattr(g4f.Provider, name, None)
+        if provider is not None:
+            chain.append((provider, model))
+    chain.append((None, g4f.models.default))  # last resort, no pin
+    return chain
+
 
 def do_chat(user_name: str, history: List[dict]) -> str:
     messages = [{"role": "system", "content": build_prompt(user_name)}] + history
-    last_err = None
-    for model in MODEL_FALLBACK_CHAIN:
+    for provider, model in _provider_chain():
         try:
-            raw = g4f.ChatCompletion.create(model=model, messages=messages, stream=False)
+            kwargs = {"model": model, "messages": messages, "stream": False}
+            if provider is not None:
+                kwargs["provider"] = provider
+            raw = g4f.ChatCompletion.create(**kwargs)
             response = raw if isinstance(raw, str) else raw.get("choices", [{}])[0].get("message", {}).get("content", "")
             response = (response or "").strip()
-            # if the model ignored the persona and mentions itself/OpenAI, skip to next model
-            if response and not re.search(r"\b(openai|chatgpt|gpt-4|gpt-3|language model|i am an ai)\b", response, re.IGNORECASE):
-                return add_sarcasm_emoji(strip_reasoning(response))
-        except Exception as e:
-            last_err = e
+            if response and not looks_like_reasoning_leak(response):
+                cleaned = strip_reasoning(response)
+                if cleaned and not looks_like_reasoning_leak(cleaned):
+                    return add_sarcasm_emoji(cleaned)
+        except Exception:
             continue
     return add_sarcasm_emoji("Abhi thoda gadbad hai server mein, dobara try kar.")
 
