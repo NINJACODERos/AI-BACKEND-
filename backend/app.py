@@ -9,7 +9,9 @@ Deploy free on Render.com or Hugging Face Spaces.
 import os
 import re
 import time
+import random
 import asyncio
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import List, Optional
 
 os.environ.setdefault("G4F_COOKIES_DIR", "/tmp/g4f_har_and_cookies")
@@ -30,10 +32,11 @@ try:
 except ImportError:
     from duckduckgo_search import DDGS
 
-try:
-    from g4f.Provider import bing
-except ImportError:
-    bing = None
+# Note: the original code's `from g4f.Provider import bing` never actually
+# worked — the real class is `Bing` (capitalized) and it requires login
+# cookies, so this silently fell back to None and Bing images never loaded.
+# We now get real Bing results through ddgs's own backend= parameter below,
+# which needs no auth.
 
 try:
     from duckduckai import ask as duckai_ask
@@ -44,6 +47,8 @@ try:
     from duck_chat import DuckChat
 except ImportError:
     DuckChat = None
+
+_pool = ThreadPoolExecutor(max_workers=4)
 
 
 app = FastAPI(title="Majdoor AI Backend")
@@ -173,42 +178,56 @@ def do_chat(user_name: str, history: List[dict]) -> str:
             kwargs = {"model": model, "messages": messages, "stream": False}
             if provider is not None:
                 kwargs["provider"] = provider
-            raw = g4f.ChatCompletion.create(**kwargs)
+            future = _pool.submit(g4f.ChatCompletion.create, **kwargs)
+            raw = future.result(timeout=12)  # skip to next provider if it hangs
             response = raw if isinstance(raw, str) else raw.get("choices", [{}])[0].get("message", {}).get("content", "")
             response = (response or "").strip()
             if response and not looks_like_reasoning_leak(response):
                 cleaned = strip_reasoning(response)
                 if cleaned and not looks_like_reasoning_leak(cleaned):
                     return add_sarcasm_emoji(cleaned)
+        except FutureTimeoutError:
+            continue
         except Exception:
             continue
     return add_sarcasm_emoji("Abhi thoda gadbad hai server mein, dobara try kar.")
 
 
-def search_image_ddg(query, retries=2, delay=2, count=7):
-    backends_to_try = ["auto", "bing"]
-    last_error = None
-    for backend in backends_to_try:
-        for attempt in range(retries):
+def _fetch_images_from_backend(query, backend, pool_size=20):
+    """Fetch a larger pool from one ddgs backend, so we can randomly sample
+    from it — asking for exactly N results returns the same top-N every
+    time, which is why repeated searches showed identical images."""
+    try:
+        with DDGS() as ddgs:
             try:
-                with DDGS() as ddgs:
-                    try:
-                        hits = list(ddgs.images(query, region='wt-wt', safesearch='Off', max_results=count, backend=backend))
-                    except TypeError:
-                        hits = list(ddgs.images(query, region='wt-wt', safesearch='Off', max_results=count))
-                if hits:
-                    urls = [h.get('image') or h.get('thumbnail') or h.get('url') for h in hits]
-                    urls = [u for u in urls if u]
-                    if urls:
-                        return urls, None
-                break
-            except Exception as e:
-                last_error = e
-                if "403" in str(e) or "ratelimit" in str(e).lower():
-                    time.sleep(delay * (attempt + 1))
-                    continue
-                break
-    return [], f"Duck image search error: {last_error}"
+                hits = list(ddgs.images(query, region='wt-wt', safesearch='Off', max_results=pool_size, backend=backend))
+            except TypeError:
+                hits = list(ddgs.images(query, region='wt-wt', safesearch='Off', max_results=pool_size))
+        urls = [h.get('image') or h.get('thumbnail') or h.get('url') for h in hits]
+        return [u for u in urls if u]
+    except Exception:
+        return []
+
+
+def search_images_combined(query, per_source=5):
+    """Real search results from two independent backends (DuckDuckGo's own
+    index + Bing, both via ddgs — no login needed), randomly sampled from a
+    bigger pool each time so repeat searches don't show the same images."""
+    duck_pool = _fetch_images_from_backend(query, "duckduckgo")
+    bing_pool = _fetch_images_from_backend(query, "bing")
+
+    duck_pick = random.sample(duck_pool, min(per_source, len(duck_pool))) if duck_pool else []
+    bing_pick = random.sample(bing_pool, min(per_source, len(bing_pool))) if bing_pool else []
+
+    # dedupe while keeping order
+    seen = set()
+    combined = []
+    for u in duck_pick + bing_pick:
+        if u not in seen:
+            seen.add(u)
+            combined.append(u)
+
+    return combined, len(duck_pick), len(bing_pick)
 
 
 # ---------- request/response models ----------
@@ -268,32 +287,17 @@ def chat(req: ChatRequest):
             reply = "❌ Duck.ai packages installed nahi hain."
         return {"type": "text", "reply": reply}
 
-    # img/ — image search: 5 from DuckDuckGo + 5 from Bing, combined
+    # img/ — image search: 5 from DuckDuckGo + 5 from Bing (both real search
+    # results via ddgs, randomly sampled so repeat searches show fresh images)
     if text.startswith("img/ "):
         prompt = text[5:].strip()
-        all_urls = []
-
-        duck_urls, duck_error = search_image_ddg(prompt, count=5)
-        all_urls.extend(duck_urls)
-
-        bing_urls = []
-        if bing:
-            for _ in range(5):
-                try:
-                    imgs = bing.create_images(prompt)
-                    if imgs:
-                        pick = imgs[0] if isinstance(imgs, list) else imgs
-                        if pick and pick not in bing_urls and pick not in duck_urls:
-                            bing_urls.append(pick)
-                except Exception:
-                    break
-        all_urls.extend(bing_urls)
+        all_urls, duck_count, bing_count = search_images_combined(prompt, per_source=5)
 
         if all_urls:
-            caption = f"🖼️ {len(duck_urls)} DuckDuckGo se + {len(bing_urls)} Bing se:"
+            caption = f"🖼️ {duck_count} DuckDuckGo se + {bing_count} Bing se:"
             return {"type": "images", "caption": caption, "images": all_urls}
 
-        return {"type": "text", "reply": f"❌ {duck_error} 🧑‍💻🐛"}
+        return {"type": "text", "reply": f"❌ '{prompt}' ke liye kuch nahi mila, dusra try kar. 🧑‍💻🐛"}
 
     # normal chat
     full_history = history + [{"role": "user", "content": text}]
