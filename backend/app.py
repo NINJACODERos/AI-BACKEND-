@@ -290,8 +290,8 @@ def chat(req: ChatRequest):
     # img/ — image search: 5 from DuckDuckGo + 5 from Bing (both real search
     # results via ddgs, randomly sampled so repeat searches show fresh images)
     if text.startswith("img/ "):
-        prompt = text[5:].strip()
-        all_urls, duck_count, bing_count = search_images_combined(prompt, per_source=5)
+        prompt = text[10:].strip()
+        all_urls, duck_count, bing_count = search_images_combined(prompt, per_source=10)
 
         if all_urls:
             caption = f"🖼️ {duck_count} DuckDuckGo se + {bing_count} Bing se:"
